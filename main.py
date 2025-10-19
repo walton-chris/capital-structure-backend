@@ -33,11 +33,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# OpenAI client - UPDATED for new library
+# OpenAI client
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = None
 if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
-    logger.info("✓ OpenAI API key configured")
+    from openai import OpenAI
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    logger.info("✓ OpenAI client initialized")
 else:
     logger.error("✗ OPENAI_API_KEY not found")
 
@@ -172,7 +174,7 @@ async def extract_data(request: DocumentExtractRequest):
     try:
         logger.info(f"🔍 EXTRACT: {request.file_id}")
         
-        if not OPENAI_API_KEY:
+        if not openai_client:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="AI service unavailable")
         
         if request.file_id not in file_storage:
@@ -208,7 +210,7 @@ async def extract_data(request: DocumentExtractRequest):
         
         try:
             logger.info("🤖 Calling OpenAI...")
-            response = openai.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 response_format={"type": "json_object"},
                 messages=[
