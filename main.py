@@ -33,13 +33,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# OpenAI client
+# OpenAI configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai_client = None
 if OPENAI_API_KEY:
-    from openai import OpenAI
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    logger.info("✓ OpenAI client initialized")
+    openai.api_key = OPENAI_API_KEY
+    logger.info("✓ OpenAI API key configured")
 else:
     logger.error("✗ OPENAI_API_KEY not found")
 
@@ -174,7 +172,7 @@ async def extract_data(request: DocumentExtractRequest):
     try:
         logger.info(f"🔍 EXTRACT: {request.file_id}")
         
-        if not openai_client:
+        if not OPENAI_API_KEY:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="AI service unavailable")
         
         if request.file_id not in file_storage:
@@ -210,9 +208,8 @@ async def extract_data(request: DocumentExtractRequest):
         
         try:
             logger.info("🤖 Calling OpenAI...")
-            response = openai_client.chat.completions.create(
+            response = openai.ChatCompletion.create(
                 model="gpt-4o-mini",
-                response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": document_text}
@@ -243,3 +240,12 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+```
+
+Also update `requirements.txt` to:
+```
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+openai==1.3.0
+python-multipart==0.0.6
