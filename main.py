@@ -13,18 +13,15 @@ import logging
 import os
 import openai
 
-# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FastAPI app
 app = FastAPI(
     title="Capital Structure API",
     description="Document upload and AI extraction for 409A valuations",
     version="2.0.0"
 )
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,7 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# OpenAI configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
@@ -41,12 +37,10 @@ if OPENAI_API_KEY:
 else:
     logger.error("✗ OPENAI_API_KEY not found")
 
-# Constants
 MAX_FILE_SIZE_BYTES = 6_000_000
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx", ".xlsx"}
 file_storage = {}
 
-# Models
 class Security(BaseModel):
     name: str
     shares_outstanding: float
@@ -90,7 +84,6 @@ class DocumentUploadResponse(BaseModel):
 class DocumentExtractRequest(BaseModel):
     file_id: str
 
-# Helper functions
 def sanitize_filename(original_filename: str) -> Tuple[str, str]:
     ext = Path(original_filename).suffix.lower()
     safe_filename = f"{uuid.uuid4()}{ext}"
@@ -118,7 +111,6 @@ def validate_and_decode_base64(content: str) -> bytes:
         raise ValueError(f"File ({size_mb:.2f}MB) exceeds max ({max_mb:.2f}MB)")
     return decoded
 
-# Routes
 @app.get("/")
 async def root():
     return {
@@ -240,12 +232,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-```
-
-Also update `requirements.txt` to:
-```
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-pydantic==2.5.3
-openai==1.3.0
-python-multipart==0.0.6
