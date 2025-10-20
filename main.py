@@ -39,45 +39,25 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # =============================================================================
-# FastAPI App & CORS Middleware
+# FastAPI App & CORS Middleware (DEVELOPMENT ONLY - PERMISSIVE)
 # =============================================================================
 
 app = FastAPI(
     title="Capital Structure API",
-    version="3.0.0",
+    version="3.0.1-dev",
     description="API for extracting structured data from financial documents."
 )
 
-# --- CORS Configuration ------------------------------------------------------
-# Reads configuration directly from environment variables.
-# For security, prefer a specific list of origins over a regex if possible.
-ALLOWED_ORIGINS_ENV = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
-ALLOWED_ORIGIN_REGEX = os.getenv("CORS_ALLOWED_ORIGIN_REGEX", "").strip()
-
-if ALLOWED_ORIGINS_ENV and ALLOWED_ORIGIN_REGEX:
-    logger.warning(
-        "Both CORS_ALLOWED_ORIGINS and CORS_ALLOWED_ORIGIN_REGEX are set. "
-        "Prefer using only one. The regular expression will be used."
-    )
-
-middleware_kwargs = {
-    "allow_methods": ["GET", "POST", "OPTIONS"],
-    "allow_headers": ["*"],
-    "allow_credentials": os.getenv("CORS_ALLOW_CREDENTIALS", "false").lower() == "true",
-    "max_age": 600,
-}
-
-if ALLOWED_ORIGIN_REGEX:
-    middleware_kwargs["allow_origin_regex"] = ALLOWED_ORIGIN_REGEX
-elif ALLOWED_ORIGINS_ENV:
-    middleware_kwargs["allow_origins"] = [
-        origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",") if origin.strip()
-    ]
-else:
-    logger.warning("CORS_ALLOWED_ORIGINS is not set. No cross-origin requests will be allowed.")
-    middleware_kwargs["allow_origins"] = [] # Default to no origins allowed
-
-app.add_middleware(CORSMiddleware, **middleware_kwargs)
+# WARNING: This is a permissive configuration for early development.
+# It allows requests from ANY origin. This is a quick way to unblock development.
+# Before moving to production, you MUST restrict this to your frontend's domain.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # =============================================================================
