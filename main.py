@@ -3,6 +3,7 @@ import base64
 import uuid
 import json
 import io
+import re
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,32 +62,55 @@ class DocumentUploadResponse(BaseModel):
     file_size_bytes: int
 
 # Excel parsing functions
+def clean_security_name(name: str) -> str:
+    """Remove abbreviations in parentheses and clean up security names"""
+    if not name:
+        return ""
+    # Remove content in parentheses like (CS), (PS), (PA), etc.
+    cleaned = re.sub(r'\s*\([^)]*\)\s*', '', str(name))
+    # Remove conversion ratio text
+    cleaned = re.sub(r'\s*\d+:\d+\s*Conversion Ratio', '', cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+def is_conversion_ratio_column(header: str) -> bool:
+    """Check if a column header indicates it's a conversion ratio column"""
+    if not header:
+        return False
+    header_lower = str(header).lower()
+    return 'conversion ratio' in header_lower or '1:1' in header_lower
+
 def parse_excel_cap_table(file_bytes: bytes) -> Dict[str, Any]:
     """Parse Excel file and extract structured cap table data"""
     try:
         workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
         
-        # Try to find the main cap table sheet
+        # Find sheets by content
         cap_table_sheet = None
         option_ledger_sheet = None
         
-        for sheet_name in workbook.sheetnames:
-            if 'cap table' in sheet_name.lower() or 'detailed' in sheet_name.lower():
-                cap_table_sheet = workbook[sheet_name]
-            elif 'option' in sheet_name.lower() or 'ledger' in sheet_name.lower():
-                option_ledger_sheet = workbook[sheet_name]
+        for sheet in workbook.worksheets:
+            sheet_name_lower = sheet.title.lower()
+            
+            # Check first few rows for content indicators
+            first_rows_text = ' '.join([
+                str(cell.value or '') 
+                for row in sheet.iter_rows(min_row=1, max_row=5, values_only=True)
+                for cell in row
+            ]).lower()
+            
+            if ('cap table' in sheet_name_lower or 'detailed' in sheet_name_lower or 
+                ('common' in first_rows_text and 'preferred' in first_rows_text)):
+                cap_table_sheet = sheet
+            elif 'option' in sheet_name_lower or 'grant' in sheet_name_lower:
+                option_ledger_sheet = sheet
         
-        # If no specific sheet found, use first sheet
+        # Use first sheet as cap table if none found
         if cap_table_sheet is None:
             cap_table_sheet = workbook.worksheets[0]
         
-        # Extract cap table data
+        # Extract data
         cap_table_data = extract_cap_table_structure(cap_table_sheet)
-        
-        # Extract option ledger data if exists
-        option_data = None
-        if option_ledger_sheet:
-            option_data = extract_option_ledger(option_ledger_sheet)
+        option_data = extract_option_ledger(option_ledger_sheet) if option_ledger_sheet else []
         
         return {
             "cap_table": cap_table_data,
@@ -101,60 +125,113 @@ def extract_cap_table_structure(sheet) -> Dict[str, Any]:
     """Extract structured data from cap table sheet"""
     data = {
         "headers": [],
-        "security_classes": {},
+        "raw_headers": [],
         "totals": {},
-        "prices": {}
+        "prices": {},
+        "options_outstanding": None,
+        "option_pool_available": None
     }
     
-    # Find header row (usually contains "Name", "Common", "Series", etc.)
-    header_row = None
-    for row_idx, row in enumerate(sheet.iter_rows(min_row=1, max_row=10), start=1):
-        row_values = [cell.value for cell in row if cell.value]
-        if any(val and ('Common' in str(val) or 'Series' in str(val)) for val in row_values):
-            header_row = row_idx
-            data["headers"] = [cell.value for cell in row]
-            break
+    # Convert sheet to list for easier processing
+    all_rows = list(sheet.iter_rows(values_only=True))
     
-    if not header_row:
+    if len(all_rows) == 0:
         return data
     
-    # Find the rows with totals and prices (usually at bottom)
-    for row in sheet.iter_rows(min_row=header_row + 1):
-        row_label = str(row[0].value or '').strip().lower()
+    # Find header row (contains "Name" or "Stakeholder" + security class names)
+    header_row_idx = None
+    for idx, row in enumerate(all_rows[:15]):
+        row_str = ' '.join([str(cell) for cell in row if cell]).lower()
+        if ('common' in row_str and ('series' in row_str or 'preferred' in row_str)) or \
+           ('name' in row_str and ('common' in row_str or 'stock' in row_str)):
+            header_row_idx = idx
+            data["raw_headers"] = list(row)
+            
+            # Process headers: clean names and skip conversion ratio columns
+            cleaned_headers = []
+            skip_next = False
+            
+            for i, header in enumerate(row):
+                if skip_next:
+                    skip_next = False
+                    cleaned_headers.append(None)  # Placeholder for conversion column
+                    continue
+                
+                if header and is_conversion_ratio_column(str(header)):
+                    cleaned_headers.append(None)  # Mark as conversion column
+                elif header:
+                    clean_name = clean_security_name(header)
+                    cleaned_headers.append(clean_name)
+                    
+                    # Check if next column is conversion ratio for this security
+                    if i + 1 < len(row) and row[i + 1]:
+                        next_header = str(row[i + 1])
+                        if is_conversion_ratio_column(next_header) and clean_name in next_header:
+                            skip_next = True
+                else:
+                    cleaned_headers.append(None)
+            
+            data["headers"] = cleaned_headers
+            break
+    
+    if header_row_idx is None:
+        return data
+    
+    # Search bottom 30 rows for summary data
+    start_search = max(header_row_idx + 1, len(all_rows) - 30)
+    
+    for idx in range(start_search, len(all_rows)):
+        row = all_rows[idx]
+        if not row or not row[0]:
+            continue
         
-        # Extract total shares outstanding
-        if 'total shares outstanding' in row_label or 'fully diluted shares' in row_label:
-            for idx, cell in enumerate(row[1:], start=1):
-                if cell.value and isinstance(cell.value, (int, float)) and cell.value > 0:
-                    col_name = data["headers"][idx] if idx < len(data["headers"]) else f"Column_{idx}"
-                    if col_name:
-                        data["totals"][str(col_name)] = float(cell.value)
+        row_label = str(row[0]).strip().lower()
+        
+        # Extract shares outstanding totals
+        if 'fully diluted shares' in row_label or 'total shares outstanding' in row_label:
+            for col_idx in range(1, min(len(row), len(data["headers"]))):
+                cell_value = row[col_idx]
+                header = data["headers"][col_idx]
+                
+                # Skip conversion columns and null headers
+                if header is None:
+                    continue
+                
+                # Check if this is actually a shares count (not a percentage)
+                if cell_value and isinstance(cell_value, (int, float)) and cell_value > 1000:
+                    data["totals"][header] = float(cell_value)
         
         # Extract price per share
         elif 'price per share' in row_label:
-            for idx, cell in enumerate(row[1:], start=1):
-                if cell.value:
-                    col_name = data["headers"][idx] if idx < len(data["headers"]) else f"Column_{idx}"
-                    if col_name:
-                        # Clean price string
-                        price_str = str(cell.value).replace('$', '').replace(',', '').strip()
-                        try:
-                            data["prices"][str(col_name)] = float(price_str)
-                        except:
-                            pass
+            for col_idx in range(1, min(len(row), len(data["headers"]))):
+                cell_value = row[col_idx]
+                header = data["headers"][col_idx]
+                
+                # Skip conversion columns and null headers
+                if header is None or not cell_value:
+                    continue
+                
+                # Clean and parse price
+                price_str = str(cell_value).replace('$', '').replace(',', '').strip()
+                try:
+                    price = float(price_str)
+                    if price >= 0:
+                        data["prices"][header] = price
+                except (ValueError, TypeError):
+                    pass
         
-        # Extract option pool
-        elif 'available for issuance' in row_label or 'option pool' in row_label:
-            for cell in row[1:]:
-                if cell.value and isinstance(cell.value, (int, float)) and cell.value > 0:
-                    data["option_pool_available"] = float(cell.value)
+        # Extract options outstanding
+        elif 'option' in row_label and 'outstanding' in row_label and 'issued' in row_label:
+            for cell_value in row[1:]:
+                if cell_value and isinstance(cell_value, (int, float)) and cell_value > 0:
+                    data["options_outstanding"] = float(cell_value)
                     break
         
-        # Extract outstanding options
-        elif "option" in row_label and "outstanding" in row_label:
-            for cell in row[1:]:
-                if cell.value and isinstance(cell.value, (int, float)) and cell.value > 0:
-                    data["options_outstanding"] = float(cell.value)
+        # Extract option pool available
+        elif 'available for issuance' in row_label or ('shares available' in row_label and 'plan' in row_label):
+            for cell_value in row[1:]:
+                if cell_value and isinstance(cell_value, (int, float)) and cell_value > 0:
+                    data["option_pool_available"] = float(cell_value)
                     break
     
     return data
@@ -164,46 +241,52 @@ def extract_option_ledger(sheet) -> List[Dict[str, Any]]:
     options = []
     
     # Find header row
-    header_row = None
+    header_row_idx = None
     headers = {}
     
-    for row_idx, row in enumerate(sheet.iter_rows(min_row=1, max_row=10), start=1):
-        row_values = [str(cell.value or '').lower() for cell in row]
+    for idx, row in enumerate(sheet.iter_rows(min_row=1, max_row=15, values_only=True)):
+        row_text = ' '.join([str(cell or '').lower() for cell in row])
         
-        # Look for key column headers
-        if any('exercise' in val and 'price' in val for val in row_values):
-            header_row = row_idx
+        # Look for key indicators of header row
+        if 'exercise' in row_text and 'price' in row_text:
+            header_row_idx = idx + 1
             
             # Map column names to indices
-            for idx, cell in enumerate(row):
-                col_name = str(cell.value or '').lower().strip()
+            for col_idx, cell in enumerate(row):
+                if not cell:
+                    continue
+                
+                col_name = str(cell).lower().strip()
+                
+                # Look for key columns
                 if 'outstanding' in col_name and 'option' in col_name:
-                    headers['options_outstanding'] = idx
+                    headers['options_outstanding'] = col_idx
                 elif 'granted' in col_name and 'option' in col_name:
-                    headers['options_granted'] = idx
+                    headers['options_granted'] = col_idx
                 elif 'exercise' in col_name and 'price' in col_name:
-                    headers['exercise_price'] = idx
-                elif col_name == 'id':
-                    headers['id'] = idx
+                    headers['exercise_price'] = col_idx
+                elif col_name in ['id', 'stakeholder id']:
+                    headers['id'] = col_idx
                 elif 'name' in col_name or 'optionholder' in col_name:
-                    headers['name'] = idx
+                    headers['name'] = col_idx
             break
     
-    if not header_row or 'options_outstanding' not in headers or 'exercise_price' not in headers:
+    if not header_row_idx or 'options_outstanding' not in headers or 'exercise_price' not in headers:
         return []
     
     # Extract option data
-    for row in sheet.iter_rows(min_row=header_row + 1):
+    for row in sheet.iter_rows(min_row=header_row_idx + 1, values_only=True):
         try:
-            outstanding = row[headers['options_outstanding']].value
-            exercise_price = row[headers['exercise_price']].value
+            outstanding = row[headers['options_outstanding']]
+            exercise_price = row[headers['exercise_price']]
             
-            # Skip if no outstanding options or invalid data
+            # Skip rows with no outstanding options
             if not outstanding or not exercise_price:
                 continue
             
+            # Must be a positive number
             if isinstance(outstanding, (int, float)) and outstanding > 0:
-                # Clean exercise price
+                # Clean exercise price (handle $ and commas)
                 price_str = str(exercise_price).replace('$', '').replace(',', '').strip()
                 price_float = float(price_str)
                 
@@ -212,76 +295,66 @@ def extract_option_ledger(sheet) -> List[Dict[str, Any]]:
                     'exercise_price': price_float
                 }
                 
-                # Add optional fields
-                if 'id' in headers:
-                    option_entry['id'] = row[headers['id']].value
-                if 'name' in headers:
-                    option_entry['name'] = row[headers['name']].value
-                if 'options_granted' in headers:
-                    granted = row[headers['options_granted']].value
-                    if granted:
-                        option_entry['options_granted'] = float(granted)
+                # Add optional identifying info
+                if 'id' in headers and headers['id'] < len(row):
+                    option_entry['id'] = row[headers['id']]
+                if 'name' in headers and headers['name'] < len(row):
+                    option_entry['name'] = row[headers['name']]
                 
                 options.append(option_entry)
         
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError, IndexError):
             continue
     
     return options
 
-# System prompt for OpenAI (simplified since we now send structured data)
+# System prompt for OpenAI
 EXTRACTION_SYSTEM_PROMPT = """You are an expert financial analyst specializing in venture capital cap tables.
 
-You will receive PRE-PROCESSED, STRUCTURED data from a cap table in JSON format. Your job is to convert this into the required output format.
+You receive STRUCTURED data extracted from Excel cap tables.
+
+INPUT FORMAT:
+{
+  "cap_table": {
+    "totals": {"Common Stock": 8054469, "Series Seed Preferred": 2285713, ...},
+    "prices": {"Series Seed Preferred": 0.44, "Series A Preferred Stock": 42.57, ...},
+    "options_outstanding": 899337,
+    "option_pool_available": 1167233
+  },
+  "option_ledger": [
+    {"options_outstanding": 114286, "exercise_price": 0.81},
+    ...
+  ]
+}
 
 INSTRUCTIONS:
 
-1. **Security Classes:**
-   - Use the "totals" field to get shares_outstanding for each security class
-   - Use the "prices" field to get original_investment_per_share
-   - Common stock always has price = $0.00
+1. **Create security entries:**
+   - For each key in "totals", create a security
+   - shares_outstanding = value from "totals"
+   - original_investment_per_share = value from "prices" (use 0.0 if missing)
 
-2. **Options - CRITICAL:**
-   - You will receive a pre-processed "option_ledger" with individual grants
-   - Group options by "exercise_price"
-   - For each unique exercise price, sum the "options_outstanding" values
-   - Create separate security entries named: "Options at $X.XX Exercise Price"
-   - The shares_outstanding = sum of options_outstanding for that price
-   - The original_investment_per_share = the exercise_price
-   - DO NOT use "options_granted" - only use "options_outstanding"
+2. **Process options:**
+   - Group "option_ledger" by "exercise_price"
+   - Sum "options_outstanding" for each price
+   - Create entries: "Options at $X.XX Exercise Price"
+   - Verify total ≈ cap_table["options_outstanding"]
 
-3. **Option Pool:**
-   - Use "option_pool_available" for total_option_pool_shares
-   - This is shares available for future grants
+3. **Set total_option_pool_shares:**
+   - Use cap_table["option_pool_available"]
 
 4. **Seniority:**
-   - If all preferred classes have liquidation_preference_multiple = 1.0, they are pari passu
-   - All pari passu preferred = seniority 1
-   - Common stock = seniority null
-   - Options = seniority null
+   - All preferred with 1.0x liquidation = seniority 1
+   - Common/Options = seniority null
 
-5. **Default Values:**
-   - Unless specified: liquidation_preference_multiple = 1.0
-   - Unless specified: is_participating = false
-   - Unless specified: participation_cap_multiple = 0.0
-   - Unless specified: cumulative_dividend_rate = 0.0
-   - Unless specified: years_since_issuance = 0.0
+5. **Defaults:**
+   - Preferred: liquidation_preference_multiple = 1.0
+   - Common/Options: liquidation_preference_multiple = 0.0
+   - All: is_participating = false, participation_cap_multiple = 0.0, cumulative_dividend_rate = 0.0, years_since_issuance = 0.0
 
-Return ONLY valid JSON with NO markdown code blocks:
+Return ONLY valid JSON (no markdown):
 {
-  "securities": [
-    {
-      "name": "Common Stock",
-      "shares_outstanding": 8054469,
-      "original_investment_per_share": 0.0,
-      "liquidation_preference_multiple": 0.0,
-      "seniority": null,
-      "is_participating": false,
-      "participation_cap_multiple": 0.0,
-      "cumulative_dividend_rate": 0.0,
-      "years_since_issuance": 0.0
-    }
-  ],
+  "securities": [...],
   "total_option_pool_shares": 1167233
 }"""
 
@@ -298,14 +371,10 @@ async def health():
 async def upload_document(request: FileUploadRequest):
     """Upload a document for processing"""
     try:
-        # Decode base64 content
         file_bytes = base64.b64decode(request.file_content)
-        
-        # Generate unique file ID
         file_extension = request.file_name.split('.')[-1].lower()
         file_id = f"upload_{uuid.uuid4()}.{file_extension}"
         
-        # Store in memory
         file_storage[file_id] = {
             "content": file_bytes,
             "original_name": request.file_name,
@@ -327,7 +396,6 @@ async def upload_document(request: FileUploadRequest):
 async def extract_data(request: DocumentExtractRequest):
     """Extract capital structure data from uploaded document"""
     try:
-        # Get file from storage
         if request.file_id not in file_storage:
             raise HTTPException(status_code=404, detail="File not found")
         
@@ -337,36 +405,54 @@ async def extract_data(request: DocumentExtractRequest):
         
         # Process based on file type
         if file_extension in ['xlsx', 'xls']:
-            # Parse Excel file
             structured_data = parse_excel_cap_table(file_bytes)
+            
+            # Debug logging
+            print("=" * 60)
+            print("EXTRACTED CAP TABLE DATA:")
+            print("=" * 60)
+            cap_table = structured_data.get("cap_table", {})
+            print(f"Headers found: {cap_table.get('headers', [])}")
+            print(f"Totals: {json.dumps(cap_table.get('totals', {}), indent=2)}")
+            print(f"Prices: {json.dumps(cap_table.get('prices', {}), indent=2)}")
+            print(f"Options outstanding: {cap_table.get('options_outstanding')}")
+            print(f"Option pool available: {cap_table.get('option_pool_available')}")
+            print(f"\nOption ledger entries: {len(structured_data.get('option_ledger', []))}")
+            if structured_data.get('option_ledger'):
+                # Group by exercise price for summary
+                from collections import defaultdict
+                by_price = defaultdict(list)
+                for opt in structured_data['option_ledger']:
+                    by_price[opt['exercise_price']].append(opt['options_outstanding'])
+                for price, outstandings in sorted(by_price.items()):
+                    total = sum(outstandings)
+                    print(f"  ${price}: {len(outstandings)} grants = {total:,.0f} shares")
+            print("=" * 60)
+            
             document_text = json.dumps(structured_data, indent=2)
         else:
-            # Text file - use as-is
             document_text = file_bytes.decode("utf-8")
-            structured_data = {"source": "text"}
         
-        # Call OpenAI for extraction
+        # Call OpenAI
         response = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Extract capital structure data from this {'structured Excel data' if file_extension in ['xlsx', 'xls'] else 'document'}:\n\n{document_text}"}
+                {"role": "user", "content": f"Extract capital structure:\n\n{document_text}"}
             ],
             temperature=0.1,
             max_tokens=3000
         )
         
-        # Parse response
         extracted_json = response.choices[0].message.content.strip()
         
-        # Remove markdown code blocks if present
+        # Remove markdown if present
         if extracted_json.startswith("```"):
             extracted_json = extracted_json.split("```")[1]
             if extracted_json.startswith("json"):
                 extracted_json = extracted_json[4:]
             extracted_json = extracted_json.strip()
         
-        # Validate and return
         result = CapitalStructureInput.model_validate_json(extracted_json)
         return result
         
