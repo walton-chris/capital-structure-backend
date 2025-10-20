@@ -76,13 +76,16 @@ CRITICAL INSTRUCTIONS FOR CAP TABLES:
 
 2. **Stock Options - CRITICAL:**
    - If you see an "Options Ledger" or "Stock Option and Grant Plan Ledger", you MUST parse it
-   - Group all outstanding options by their "Exercise Price"
+   - Look for the "Options Outstanding" column (NOT "Options Granted")
+   - Some options may have been exercised or canceled, so Outstanding < Granted
+   - Group all outstanding options by their "Exercise Price" column
    - Create a SEPARATE security entry for each unique exercise price
    - Name them: "Options at $X.XX Exercise Price"
-   - The shares_outstanding for each option class = sum of all "Options Outstanding" at that exercise price
+   - The shares_outstanding for each option class = sum of ONLY the "Options Outstanding" column for that exercise price
    - The original_investment_per_share = the exercise price
+   - DO NOT include canceled, expired, or exercised options
    - DO NOT create a single "Options and RSUs" security
-   - Total options across all exercise prices must equal the "Options outstanding" number in the main cap table
+   - Total options across all exercise prices must equal the "Options outstanding" number in the main cap table (usually ~899,337)
 
 3. **Options Available for Grant:**
    - Look for "Shares available for issuance under the plan"
