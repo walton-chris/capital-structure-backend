@@ -7,8 +7,7 @@ import re
 import tempfile
 import logging
 import binascii
-from typing import List, Optional, Dict, Any, Tuple
-from collections import defaultdict
+from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,8 +35,8 @@ client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else
 # =============================================================================
 app = FastAPI(
     title="Capital Structure API",
-    version="9.0.0-deterministic",
-    description="API using a deterministic-first approach for fast and reliable extraction."
+    version="9.1.0-refined-hybrid",
+    description="API using a refined hybrid model for fast and accurate extraction."
 )
 app.add_middleware(
     CORSMiddleware,
@@ -47,7 +46,6 @@ app.add_middleware(
 
 file_storage: Dict[str, Dict[str, Any]] = {}
 
-# Pydantic models remain the same
 class Security(BaseModel):
     name: str; shares_outstanding: NonNegativeFloat; original_investment_per_share: NonNegativeFloat
     liquidation_preference_multiple: NonNegativeFloat; seniority: Optional[int] = Field(default=None, ge=0, le=10)
@@ -64,7 +62,7 @@ class DocumentUploadResponse(BaseModel): file_id: str; file_name: str; message: 
 
 
 # =============================================================================
-# 3. Deterministic-First Parsing & Anonymization Logic
+# 3. Hybrid Approach: Pre-Filter, Anonymize, and Convert
 # =============================================================================
 class Anonymizer:
     def __init__(self):
@@ -81,160 +79,117 @@ class Anonymizer:
         self.name_map[name] = placeholder
         return placeholder
 
-def normalize_header(header: str) -> str:
-    return re.sub(r'\s+', ' ', str(header or '')).strip().lower()
+def process_excel_for_llm(file_bytes: bytes, rid: str) -> str:
+    """Efficiently pre-filters, anonymizes, and converts only relevant Excel sheets to Markdown."""
+    try:
+        workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        anonymizer = Anonymizer()
+        
+        cap_sheet, option_sheet = None, None
+        for sheet in workbook.worksheets:
+            title = sheet.title.lower()
+            if not cap_sheet and "detailed cap" in title: cap_sheet = sheet
+            if not option_sheet and ("option" in title or "grant" in title): option_sheet = sheet
+        
+        if not cap_sheet:
+            logger.warning(f"[rid={rid}] Could not find 'Detailed Cap Table' sheet, falling back to first sheet.")
+            cap_sheet = workbook.worksheets[0]
 
-async def get_column_mapping_from_llm(headers: List[str], sample_rows: List[List[Any]], target_fields: List[str]) -> Dict[str, str]:
-    if not client: raise ValueError("LLM client not configured, cannot map columns.")
-    logger.info(f"Using LLM to map columns for headers: {headers}")
+        sheets_to_process = [s for s in [cap_sheet, option_sheet] if s is not None]
+        logger.info(f"[rid={rid}] Pre-selected sheets for processing: {[s.title for s in sheets_to_process]}")
+
+        markdown_parts = []
+        for sheet in sheets_to_process:
+            markdown_parts.append(f"## Sheet: {sheet.title}\n")
+            # Anonymize stakeholder columns before converting to markdown
+            headers = [str(cell.value) if cell.value is not None else "" for cell in sheet[1]]
+            stakeholder_col_idx = -1
+            for i, h in enumerate(headers):
+                if h.lower() in ["stakeholder", "optionholder", "name"]:
+                    stakeholder_col_idx = i
+                    break
+            
+            rows = []
+            for i, row in enumerate(sheet.iter_rows(values_only=True)):
+                if not any(cell is not None for cell in row): continue # Skip empty rows
+                
+                row_list = list(row)
+                if stakeholder_col_idx != -1 and i > 0 and len(row_list) > stakeholder_col_idx: # i>0 to skip header
+                     row_list[stakeholder_col_idx] = anonymizer.anonymize_name(str(row_list[stakeholder_col_idx]))
+                
+                rows.append([str(cell) if cell is not None else "" for cell in row_list])
+
+            if not rows: continue
+            
+            header_row = rows[0]
+            separator = ["---" for _ in header_row]
+            markdown_parts.append(f"| {' | '.join(header_row)} |")
+            markdown_parts.append(f"| {' | '.join(separator)} |")
+            for row in rows[1:]:
+                if len(row) < len(header_row): row.extend([""] * (len(header_row) - len(row)))
+                markdown_parts.append(f"| {' | '.join(row[:len(header_row)])} |")
+            markdown_parts.append("\n")
+            
+        return "\n".join(markdown_parts)
+    except Exception as e:
+        logger.exception(f"[rid={rid}] Failed during hybrid Excel processing.")
+        raise ValueError(f"Could not parse, filter, and anonymize the Excel file. Error: {e}")
+
+# =============================================================================
+# 4. LLM Integration (Single, Powerful Call with Refined Prompt)
+# =============================================================================
+
+# REFINED PROMPT: This prompt is highly specific about how to parse the different table layouts.
+EXTRACTION_PROMPT = """You are an expert financial analyst. You will be given pre-filtered, anonymized data from a company's key cap table sheets in Markdown format.
+
+Your task is to meticulously analyze the provided tables and convert the data into a single, structured JSON object.
+
+**INSTRUCTIONS FOR PARSING**:
+
+1.  **Analyze the "Detailed Cap Table" Sheet**:
+    * This table is **pivoted**. The security names (e.g., "Common Stock", "Series A Preferred Stock") are the **COLUMN HEADERS**.
+    * To find the shares for each security, you **MUST** locate the row where the first column is 'Total Shares Outstanding'.
+    * Read the values **horizontally** across this 'Total Shares Outstanding' row. Each value corresponds to the security in its respective column header.
+
+2.  **Analyze the "Option Plan" Sheet**:
+    * In this table, each **ROW** represents an option grant or a group of grants.
+    * Identify the columns for 'Shares' (or 'Amount') and 'Exercise Price' (or 'Strike Price').
+    * You **MUST** group all rows by their unique **Exercise Price** and sum the 'Shares' for each group.
+
+**CRITICAL OUTPUT RULES**:
+- Create a **separate** security entry in the final JSON for each distinct option group. The name must be "Options at $X.XX Exercise Price".
+- **DO NOT** create a single, aggregated security for all options from the main cap table.
+- Ignore any rows/columns that are clearly totals or summaries, unless specified above.
+- Your final output must be a single, valid JSON object and nothing else.
+"""
+
+async def call_llm_single_shot(focused_markdown: str, rid: str) -> Dict[str, Any]:
+    if client is None: raise HTTPException(status_code=503, detail="AI service is not configured.")
+    logger.info(f"[rid={rid}] Starting single-shot AI extraction with refined prompt.")
     try:
         def _do_call():
             return client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o", temperature=0.0,
                 response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": "Map the provided noisy headers to the target schema fields. Reply with a JSON object where keys are target fields and values are the best matching original headers. If a field cannot be matched, omit it from the JSON."},
-                    {"role": "user", "content": json.dumps({
-                        "target_fields": target_fields,
-                        "headers": headers,
-                        "sample_rows": sample_rows
-                    })}
-                ],
-                temperature=0, timeout=20.0
+                max_tokens=4096,
+                messages=[{"role": "system", "content": EXTRACTION_PROMPT}, {"role": "user", "content": focused_markdown}],
+                timeout=120.0,
             )
         resp = await run_in_threadpool(_do_call)
-        mapping = json.loads(resp.choices[0].message.content or '{}')
-        return {v: k for k, v in mapping.items()} # Invert to map: header -> target_field
+        content = resp.choices[0].message.content
+        if not content: raise HTTPException(status_code=502, detail="AI returned an empty response.")
+        logger.info(f"[rid={rid}] AI extraction complete.")
+        return json.loads(content)
+    except json.JSONDecodeError:
+        logger.error(f"[rid={rid}] Failed to parse LLM JSON. Content: {content[:500]}")
+        raise HTTPException(status_code=502, detail="AI returned malformed JSON.")
     except Exception as e:
-        logger.error(f"LLM column mapping failed: {e}")
-        return {} # Fallback to empty map on failure
-
-def parse_sheet_deterministically(sheet, header_aliases: Dict[str, str], anonymizer: Anonymizer, anonymize_column: Optional[str] = None) -> List[Dict[str, Any]]:
-    rows = list(sheet.iter_rows(values_only=True))
-    if not rows: return []
-    
-    header_row_index = -1
-    for i, row in enumerate(rows[:20]): # Search for header in first 20 rows
-        normalized_row = [normalize_header(cell) for cell in row]
-        if len([h for h in normalized_row if h in header_aliases]) > 1:
-            header_row_index = i
-            break
-    
-    if header_row_index == -1: return [] # Could not find a valid header row
-
-    headers = [normalize_header(cell) for cell in rows[header_row_index]]
-    header_map = {h: header_aliases.get(h) for h in headers if h in header_aliases}
-    
-    anonymize_col_idx = -1
-    if anonymize_column:
-        try: anonymize_col_idx = headers.index(anonymize_column)
-        except ValueError: pass
-
-    data_rows = []
-    for row in rows[header_row_index + 1:]:
-        if not any(row): continue # Skip empty rows
-        
-        row_data = {}
-        for i, cell in enumerate(row):
-            header = headers[i]
-            if header in header_map:
-                target_field = header_map[header]
-                # Column-aware anonymization
-                if i == anonymize_col_idx:
-                    row_data[target_field] = anonymizer.anonymize_name(str(cell))
-                else:
-                    row_data[target_field] = cell
-        if row_data:
-            data_rows.append(row_data)
-            
-    return data_rows
-
-# =============================================================================
-# 4. Main Extraction Orchestration
-# =============================================================================
-async def run_deterministic_extraction(file_bytes: bytes, rid: str) -> Dict[str, Any]:
-    try:
-        workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
-    except Exception as e:
-        raise ValueError(f"Could not load the Excel file. It may be corrupted. Error: {e}")
-
-    anonymizer = Anonymizer()
-    
-    # Identify sheets
-    cap_sheet, option_sheet = None, None
-    for sheet in workbook.worksheets:
-        title = sheet.title.lower()
-        if not cap_sheet and "detailed cap" in title: cap_sheet = sheet
-        if not option_sheet and ("option" in title or "grant" in title): option_sheet = sheet
-    if not cap_sheet: cap_sheet = workbook.worksheets[0]
-    
-    # Define header aliases for deterministic parsing
-    cap_header_aliases = {
-        'class': 'name', 'class of stock': 'name', 'security': 'name',
-        'shares outstanding': 'shares', 'total outstanding': 'shares', 'outstanding': 'shares',
-        'price per share': 'price', 'original price': 'price',
-    }
-    option_header_aliases = {
-        'optionholder': 'holder', 'name': 'holder',
-        'options granted': 'shares', 'shares': 'shares', 'amount': 'shares',
-        'exercise price': 'price', 'strike price': 'price',
-    }
-
-    # Deterministically parse sheets
-    cap_data = parse_sheet_deterministically(cap_sheet, cap_header_aliases, anonymizer, anonymize_column='stakeholder') if cap_sheet else []
-    option_data = parse_sheet_deterministically(option_sheet, option_header_aliases, anonymizer, anonymize_column='optionholder') if option_sheet else []
-    
-    # Aggregate results in Python
-    securities = []
-    seen_securities = set()
-
-    for item in cap_data:
-        name = item.get('name')
-        if not name or not isinstance(name, str) or name.lower() in seen_securities: continue
-        
-        shares = float(str(item.get('shares', 0)).replace(',',''))
-        if shares <= 0: continue
-
-        securities.append({
-            "name": name.strip(),
-            "shares_outstanding": shares,
-            "original_investment_per_share": float(str(item.get('price', 0)).replace(',','')),
-            # Set defaults, as this info is often not in the main table
-            "liquidation_preference_multiple": 1.0 if "preferred" in name.lower() else 0.0,
-            "seniority": 1 if "preferred" in name.lower() else None,
-            "is_participating": False, "participation_cap_multiple": 0.0,
-            "cumulative_dividend_rate": 0.0, "years_since_issuance": 0.0
-        })
-        seen_securities.add(name.lower())
-
-    # Group options by exercise price
-    options_by_price = defaultdict(float)
-    for item in option_data:
-        try:
-            price = float(str(item.get('price', 0)).replace('$', '').replace(',', ''))
-            shares = float(str(item.get('shares', 0)).replace(',', ''))
-            if price > 0 and shares > 0:
-                options_by_price[price] += shares
-        except (ValueError, TypeError):
-            continue
-            
-    for price, total_shares in options_by_price.items():
-        securities.append({
-            "name": f"Options at ${price:.2f} Exercise Price",
-            "shares_outstanding": total_shares,
-            "original_investment_per_share": 0.0, "liquidation_preference_multiple": 0.0,
-            "seniority": None, "is_participating": False, "participation_cap_multiple": 0.0,
-            "cumulative_dividend_rate": 0.0, "years_since_issuance": 0.0
-        })
-
-    # This part can be improved by a more robust search for the option pool
-    total_option_pool_shares = 0.0
-    
-    return {"securities": securities, "total_option_pool_shares": total_option_pool_shares}
+        logger.error(f"[rid={rid}] AI call failed: {e}")
+        raise HTTPException(status_code=503, detail="AI service is unavailable or timed out.")
 
 
 # =============================================================================
-# 5. API Routes
+# 5. API Routes & Server Entrypoint
 # =============================================================================
 
 @app.get("/", include_in_schema=False)
@@ -245,7 +200,6 @@ async def health(): return {"status": "healthy"}
 
 @app.post("/api/documents/upload", response_model=DocumentUploadResponse, status_code=201, tags=["Processing"])
 async def upload_document(request: FileUploadRequest):
-    # This endpoint is stable and remains the same.
     encoded_len = len(request.file_content)
     if (encoded_len * 3 / 4) > MAX_UPLOAD_BYTES: raise HTTPException(status_code=413, detail="File is too large.")
     try:
@@ -276,33 +230,33 @@ async def extract_data(payload: DocumentExtractRequest):
         logger.error(f"[rid={rid}] File missing at path: {path}")
         raise HTTPException(status_code=410, detail="File has expired.")
     
+    llm_obj = None
     try:
         def _read_and_process():
             with open(path, "rb") as f:
-                return f.read()
+                return process_excel_for_llm(f.read(), rid)
         
-        file_bytes = await run_in_threadpool(_read_and_process)
-        
-        # Run the new deterministic extraction pipeline
-        result_data = await run_deterministic_extraction(file_bytes, rid)
-        
-        # Validate the final output against our Pydantic model
-        result = CapitalStructureInput.model_validate(result_data)
-        
+        focused_markdown = await run_in_threadpool(_read_and_process)
+        llm_obj = await call_llm_single_shot(focused_markdown, rid)
+        result = CapitalStructureInput.model_validate(llm_obj)
         if not result.securities:
-            raise ValueError("Deterministic parsing resulted in an empty list of securities.")
+            raise HTTPException(status_code=502, detail="AI returned a valid but empty list of securities.")
         return result
-
-    except (ValueError, ValidationError) as e:
-        # These are now expected business logic failures (e.g., bad format)
-        logger.warning(f"[rid={rid}] Data validation or parsing failed: {e}")
-        raise HTTPException(status_code=400, detail=f"Could not process document: {e}")
-    except HTTPException:
-        raise
+    except ValidationError as e:
+        error_details = e.errors()
+        logger.error(f"[rid={rid}] Final JSON failed validation. Details: {error_details}. AI Response: {llm_obj}")
+        first_error = error_details[0]
+        field = " -> ".join(map(str, first_error['loc']))
+        msg = first_error['msg']
+        raise HTTPException(status_code=502, detail=f"AI returned invalid data structure. Field: '{field}', Error: {msg}")
+    except (ValueError, HTTPException) as e:
+        status_code = e.status_code if isinstance(e, HTTPException) else 400
+        detail = e.detail if isinstance(e, HTTPException) else str(e)
+        logger.warning(f"[rid={rid}] Handled error during extraction: {detail}")
+        raise HTTPException(status_code=status_code, detail=detail)
     except Exception:
-        logger.exception(f"[rid={rid}] An unexpected, unhandled error occurred during extraction.")
+        logger.exception(f"[rid={rid}] An unexpected, unhandled error occurred.")
         raise HTTPException(status_code=500, detail="An unexpected server error occurred.")
-        
     finally:
         try:
             if path and os.path.exists(path):
@@ -312,9 +266,6 @@ async def extract_data(payload: DocumentExtractRequest):
         except Exception as e:
             logger.error(f"[rid={rid}] CRITICAL: Failed to clean up temp file {path}: {e}")
 
-# =============================================================================
-# 6. Server Entrypoint
-# =============================================================================
 if __name__ == "__main__":
     import uvicorn
     logger.info(f"Starting server on port {PORT}...")
