@@ -94,7 +94,7 @@ def parse_excel_cap_table(file_bytes: bytes) -> Dict[str, Any]:
             
             # Check first few rows for content indicators
             first_rows_text = ' '.join([
-                str(cell.value or '') 
+                str(cell or '') 
                 for row in sheet.iter_rows(min_row=1, max_row=5, values_only=True)
                 for cell in row
             ]).lower()
