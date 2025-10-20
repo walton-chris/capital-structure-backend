@@ -1,2 +1,2 @@
-web: gunicorn app:app --workers=2 --worker-class=uvicorn.workers.UvicornWorker --timeout=75
-worker: PYTHONPATH=. rq worker extract --with-scheduler --log-level=info
+web: uvicorn app:app --host 0.0.0.0 --port $PORT
+worker: PYTHONPATH=. rq worker extract --with-scheduler --log-level=info --url ${REDIS_URL}
