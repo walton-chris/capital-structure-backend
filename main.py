@@ -155,14 +155,24 @@ def extract_cap_table_structure(sheet) -> Dict[str, Any]:
     
     for idx in range(start_search, len(all_rows)):
         row = all_rows[idx]
-        if not row or not row[0]:
+        if not row:
             continue
         
-        row_label = str(row[0]).strip().lower()
+        # CRITICAL FIX: Check BOTH column A (row[0]) and column B (row[1]) for row labels
+        # Summary rows in cap tables often have empty column A but labels in column B
+        row_label = None
+        if len(row) > 0 and row[0]:
+            row_label = str(row[0]).strip().lower()
+        elif len(row) > 1 and row[1]:
+            row_label = str(row[1]).strip().lower()
         
-        if any(keyword in row_label for keyword in ['fully', 'total', 'price', 'option', 'available']):
-            print(f"  Row {idx}: '{row_label}'")
+        # Skip if no label found in either column
+        if not row_label:
+            continue
         
+        print(f"  Row {idx}: '{row_label[:80]}'")
+        
+        # Extract shares outstanding totals
         if 'fully diluted shares' in row_label or 'total shares outstanding' in row_label:
             print(f"    FOUND TOTALS ROW: '{row_label}'")
             for col_idx in range(1, min(len(row), len(data["headers"]))):
@@ -176,6 +186,7 @@ def extract_cap_table_structure(sheet) -> Dict[str, Any]:
                     print(f"      {header}: {cell_value}")
                     data["totals"][header] = float(cell_value)
         
+        # Extract price per share
         elif 'price per share' in row_label:
             print(f"    FOUND PRICES ROW: '{row_label}'")
             for col_idx in range(1, min(len(row), len(data["headers"]))):
@@ -194,6 +205,7 @@ def extract_cap_table_structure(sheet) -> Dict[str, Any]:
                 except (ValueError, TypeError):
                     pass
         
+        # Extract options outstanding
         elif 'option' in row_label and 'outstanding' in row_label and 'issued' in row_label:
             print(f"    FOUND OPTIONS OUTSTANDING ROW: '{row_label}'")
             for cell_value in row[1:]:
@@ -202,6 +214,7 @@ def extract_cap_table_structure(sheet) -> Dict[str, Any]:
                     data["options_outstanding"] = float(cell_value)
                     break
         
+        # Extract option pool available
         elif 'available for issuance' in row_label or ('shares available' in row_label and 'plan' in row_label):
             print(f"    FOUND OPTION POOL AVAILABLE ROW: '{row_label}'")
             for cell_value in row[1:]:
@@ -280,7 +293,7 @@ You receive STRUCTURED data extracted from Excel cap tables.
 INPUT FORMAT:
 {
   "cap_table": {
-    "totals": {"Common Stock": 8054469, "Series Seed Preferred": 2285713, ...},
+    "totals": {"Common": 8054469, "Series Seed Preferred": 2285713, ...},
     "prices": {"Series Seed Preferred": 0.44, "Series A Preferred Stock": 42.57, ...},
     "options_outstanding": 899337,
     "option_pool_available": 1167233
