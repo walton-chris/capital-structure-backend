@@ -2,11 +2,13 @@ import os
 import base64
 import uuid
 import json
-from typing import List, Optional
+import io
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import openai
+import openpyxl
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -58,97 +60,214 @@ class DocumentUploadResponse(BaseModel):
     message: str
     file_size_bytes: int
 
-# System prompt for OpenAI
-EXTRACTION_SYSTEM_PROMPT = """You are an expert financial analyst specializing in venture capital cap tables and 409A valuations.
+# Excel parsing functions
+def parse_excel_cap_table(file_bytes: bytes) -> Dict[str, Any]:
+    """Parse Excel file and extract structured cap table data"""
+    try:
+        workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        
+        # Try to find the main cap table sheet
+        cap_table_sheet = None
+        option_ledger_sheet = None
+        
+        for sheet_name in workbook.sheetnames:
+            if 'cap table' in sheet_name.lower() or 'detailed' in sheet_name.lower():
+                cap_table_sheet = workbook[sheet_name]
+            elif 'option' in sheet_name.lower() or 'ledger' in sheet_name.lower():
+                option_ledger_sheet = workbook[sheet_name]
+        
+        # If no specific sheet found, use first sheet
+        if cap_table_sheet is None:
+            cap_table_sheet = workbook.worksheets[0]
+        
+        # Extract cap table data
+        cap_table_data = extract_cap_table_structure(cap_table_sheet)
+        
+        # Extract option ledger data if exists
+        option_data = None
+        if option_ledger_sheet:
+            option_data = extract_option_ledger(option_ledger_sheet)
+        
+        return {
+            "cap_table": cap_table_data,
+            "option_ledger": option_data,
+            "source": "excel"
+        }
+    
+    except Exception as e:
+        raise Exception(f"Failed to parse Excel file: {str(e)}")
 
-Your task is to extract capital structure data from uploaded documents. These documents may be:
-- Cap tables showing ownership by stakeholder
-- Term sheets
-- Stock option ledgers
-- Board resolutions
+def extract_cap_table_structure(sheet) -> Dict[str, Any]:
+    """Extract structured data from cap table sheet"""
+    data = {
+        "headers": [],
+        "security_classes": {},
+        "totals": {},
+        "prices": {}
+    }
+    
+    # Find header row (usually contains "Name", "Common", "Series", etc.)
+    header_row = None
+    for row_idx, row in enumerate(sheet.iter_rows(min_row=1, max_row=10), start=1):
+        row_values = [cell.value for cell in row if cell.value]
+        if any(val and ('Common' in str(val) or 'Series' in str(val)) for val in row_values):
+            header_row = row_idx
+            data["headers"] = [cell.value for cell in row]
+            break
+    
+    if not header_row:
+        return data
+    
+    # Find the rows with totals and prices (usually at bottom)
+    for row in sheet.iter_rows(min_row=header_row + 1):
+        row_label = str(row[0].value or '').strip().lower()
+        
+        # Extract total shares outstanding
+        if 'total shares outstanding' in row_label or 'fully diluted shares' in row_label:
+            for idx, cell in enumerate(row[1:], start=1):
+                if cell.value and isinstance(cell.value, (int, float)) and cell.value > 0:
+                    col_name = data["headers"][idx] if idx < len(data["headers"]) else f"Column_{idx}"
+                    if col_name:
+                        data["totals"][str(col_name)] = float(cell.value)
+        
+        # Extract price per share
+        elif 'price per share' in row_label:
+            for idx, cell in enumerate(row[1:], start=1):
+                if cell.value:
+                    col_name = data["headers"][idx] if idx < len(data["headers"]) else f"Column_{idx}"
+                    if col_name:
+                        # Clean price string
+                        price_str = str(cell.value).replace('$', '').replace(',', '').strip()
+                        try:
+                            data["prices"][str(col_name)] = float(price_str)
+                        except:
+                            pass
+        
+        # Extract option pool
+        elif 'available for issuance' in row_label or 'option pool' in row_label:
+            for cell in row[1:]:
+                if cell.value and isinstance(cell.value, (int, float)) and cell.value > 0:
+                    data["option_pool_available"] = float(cell.value)
+                    break
+        
+        # Extract outstanding options
+        elif "option" in row_label and "outstanding" in row_label:
+            for cell in row[1:]:
+                if cell.value and isinstance(cell.value, (int, float)) and cell.value > 0:
+                    data["options_outstanding"] = float(cell.value)
+                    break
+    
+    return data
 
-CRITICAL INSTRUCTIONS FOR CAP TABLES:
+def extract_option_ledger(sheet) -> List[Dict[str, Any]]:
+    """Extract option grants from option ledger sheet"""
+    options = []
+    
+    # Find header row
+    header_row = None
+    headers = {}
+    
+    for row_idx, row in enumerate(sheet.iter_rows(min_row=1, max_row=10), start=1):
+        row_values = [str(cell.value or '').lower() for cell in row]
+        
+        # Look for key column headers
+        if any('exercise' in val and 'price' in val for val in row_values):
+            header_row = row_idx
+            
+            # Map column names to indices
+            for idx, cell in enumerate(row):
+                col_name = str(cell.value or '').lower().strip()
+                if 'outstanding' in col_name and 'option' in col_name:
+                    headers['options_outstanding'] = idx
+                elif 'granted' in col_name and 'option' in col_name:
+                    headers['options_granted'] = idx
+                elif 'exercise' in col_name and 'price' in col_name:
+                    headers['exercise_price'] = idx
+                elif col_name == 'id':
+                    headers['id'] = idx
+                elif 'name' in col_name or 'optionholder' in col_name:
+                    headers['name'] = idx
+            break
+    
+    if not header_row or 'options_outstanding' not in headers or 'exercise_price' not in headers:
+        return []
+    
+    # Extract option data
+    for row in sheet.iter_rows(min_row=header_row + 1):
+        try:
+            outstanding = row[headers['options_outstanding']].value
+            exercise_price = row[headers['exercise_price']].value
+            
+            # Skip if no outstanding options or invalid data
+            if not outstanding or not exercise_price:
+                continue
+            
+            if isinstance(outstanding, (int, float)) and outstanding > 0:
+                # Clean exercise price
+                price_str = str(exercise_price).replace('$', '').replace(',', '').strip()
+                price_float = float(price_str)
+                
+                option_entry = {
+                    'options_outstanding': float(outstanding),
+                    'exercise_price': price_float
+                }
+                
+                # Add optional fields
+                if 'id' in headers:
+                    option_entry['id'] = row[headers['id']].value
+                if 'name' in headers:
+                    option_entry['name'] = row[headers['name']].value
+                if 'options_granted' in headers:
+                    granted = row[headers['options_granted']].value
+                    if granted:
+                        option_entry['options_granted'] = float(granted)
+                
+                options.append(option_entry)
+        
+        except (ValueError, TypeError, AttributeError):
+            continue
+    
+    return options
 
-1. **Identifying Security Classes:**
-   - Look for columns with headers like "Common", "Series Seed Preferred", "Series A Preferred", etc.
-   - The "Price per share" row at the BOTTOM of the table shows the original issue price for each class
-   - If you see a stakeholder table with many rows, scroll down to find summary rows like "Total Shares outstanding" and "Price per share"
+# System prompt for OpenAI (simplified since we now send structured data)
+EXTRACTION_SYSTEM_PROMPT = """You are an expert financial analyst specializing in venture capital cap tables.
 
-2. **Stock Options - CRITICAL:**
-   - If you see an "Options Ledger" or "Stock Option and Grant Plan Ledger", you MUST parse it carefully
-   - Look for the "Options Outstanding" column (column 5 typically, NOT "Options Granted")
-   - IMPORTANT: Some rows show 0 in "Options Outstanding" because they were exercised/canceled - SKIP THESE ROWS
-   - Only sum rows where "Options Outstanding" > 0
-   - For each row with outstanding options, note both:
-     * The "Exercise Price" value (e.g., $0.81, $3.64, $10.83)
-     * The "Options Outstanding" value (NOT "Options Granted")
-   - Group by Exercise Price and sum ONLY the "Options Outstanding" values
-   - Create a SEPARATE security entry for each unique exercise price
-   - Name them: "Options at $X.XX Exercise Price"
-   - VERIFICATION: Your total across all exercise prices MUST equal the number shown in the row "Options and RSU's issued and outstanding" (typically 899,337)
-   - If your total is higher, you're counting exercised/canceled options - recount using ONLY rows with Options Outstanding > 0
+You will receive PRE-PROCESSED, STRUCTURED data from a cap table in JSON format. Your job is to convert this into the required output format.
 
-3. **Options Available for Grant:**
-   - Look for "Shares available for issuance under the plan"
-   - This is NOT a security class - it goes in total_option_pool_shares
-   - This represents unissued options that can be granted in the future
+INSTRUCTIONS:
 
-4. **Price Parsing:**
-   - The "Price per share" row is at the BOTTOM of cap tables
-   - It shows prices for each security class in the SAME column order as the headers
-   - Example: If columns are "Common | Series Seed | Series A | Series A-1"
-   - And price row shows: "$0.00 | $0.44 | $42.57 | $7.66"
-   - Then Series A-1 price is $7.66, NOT $42.57!
-   - Be VERY careful with column alignment
+1. **Security Classes:**
+   - Use the "totals" field to get shares_outstanding for each security class
+   - Use the "prices" field to get original_investment_per_share
+   - Common stock always has price = $0.00
 
-5. **Seniority - CRITICAL:**
-   - If the document says "pari passu" OR if all preferred classes have the same liquidation preference multiple (typically 1.0x):
-     * ALL preferred stock classes MUST have seniority = 1 (not 1, 2, 3 - ALL ARE 1)
-     * Common stock = null (no seniority)
-     * Options = null (no seniority)
-   - Pari passu means "equal footing" - all preferred classes are treated equally in liquidation
-   - NEVER assign Series Seed = 1, Series A = 2, Series A-1 = 3 when they're pari passu
-   - If different liquidation preferences exist (e.g., Series A has 2x, Series B has 1x):
-     * Most senior (highest preference) = 1
-     * Next senior = 2
-     * Least senior (Common) = highest number
+2. **Options - CRITICAL:**
+   - You will receive a pre-processed "option_ledger" with individual grants
+   - Group options by "exercise_price"
+   - For each unique exercise price, sum the "options_outstanding" values
+   - Create separate security entries named: "Options at $X.XX Exercise Price"
+   - The shares_outstanding = sum of options_outstanding for that price
+   - The original_investment_per_share = the exercise_price
+   - DO NOT use "options_granted" - only use "options_outstanding"
 
-6. **Shares Outstanding:**
-   - Use the "Total Shares outstanding" row for each class
-   - For options, sum the "Options Outstanding" column for each exercise price group
-   - Ignore conversion ratio columns
-   - Ignore individual stakeholder rows - only use totals
+3. **Option Pool:**
+   - Use "option_pool_available" for total_option_pool_shares
+   - This is shares available for future grants
 
-7. **Common Stock:**
-   - Common stock always has:
-     * original_investment_per_share = 0.0
-     * liquidation_preference_multiple = 0.0
-     * is_participating = false
-     * seniority = null
+4. **Seniority:**
+   - If all preferred classes have liquidation_preference_multiple = 1.0, they are pari passu
+   - All pari passu preferred = seniority 1
+   - Common stock = seniority null
+   - Options = seniority null
 
-VALIDATION CHECKS:
-- If you see options with multiple exercise prices, you MUST create separate entries
-- Sum ONLY the "Options Outstanding" column from the ledger (not "Options Granted")
-- Total option shares across all exercise prices MUST match the cap table's "Options outstanding" row
-- If your calculated total doesn't match, recount using ONLY "Options Outstanding" column
-- The "available for grant" number goes in total_option_pool_shares
-- Never assign a preferred stock's price to a different preferred class
+5. **Default Values:**
+   - Unless specified: liquidation_preference_multiple = 1.0
+   - Unless specified: is_participating = false
+   - Unless specified: participation_cap_multiple = 0.0
+   - Unless specified: cumulative_dividend_rate = 0.0
+   - Unless specified: years_since_issuance = 0.0
 
-STEP-BY-STEP FOR OPTIONS:
-1. Find the option ledger section in the document
-2. Identify the "Options Outstanding" column (typically column 5)
-3. Identify the "Exercise Price" column (typically column 8)
-4. For EACH row in the ledger:
-   - Check if "Options Outstanding" > 0
-   - If YES: note the Exercise Price and Options Outstanding value
-   - If NO (or 0): SKIP this row (option was exercised/canceled)
-5. Group by Exercise Price: for each unique price, sum all "Options Outstanding" values
-6. Create one security entry per unique Exercise Price
-7. FINAL CHECK: Sum your three option class totals
-   - If total ≠ 899,337, you made an error - recount excluding exercised options
-   - Look for the row "Options and RSU's issued and outstanding" to verify your total
-
-Return ONLY valid JSON in this exact format:
+Return ONLY valid JSON with NO markdown code blocks:
 {
   "securities": [
     {
@@ -161,80 +280,10 @@ Return ONLY valid JSON in this exact format:
       "participation_cap_multiple": 0.0,
       "cumulative_dividend_rate": 0.0,
       "years_since_issuance": 0.0
-    },
-    {
-      "name": "Series Seed Preferred",
-      "shares_outstanding": 2285713,
-      "original_investment_per_share": 0.44,
-      "liquidation_preference_multiple": 1.0,
-      "seniority": 1,
-      "is_participating": false,
-      "participation_cap_multiple": 0.0,
-      "cumulative_dividend_rate": 0.0,
-      "years_since_issuance": 0.0
-    },
-    {
-      "name": "Series A Preferred Stock",
-      "shares_outstanding": 1411738,
-      "original_investment_per_share": 42.57,
-      "liquidation_preference_multiple": 1.0,
-      "seniority": 1,
-      "is_participating": false,
-      "participation_cap_multiple": 0.0,
-      "cumulative_dividend_rate": 0.0,
-      "years_since_issuance": 0.0
-    },
-    {
-      "name": "Series A-1 Preferred Stock",
-      "shares_outstanding": 1634508,
-      "original_investment_per_share": 7.66,
-      "liquidation_preference_multiple": 1.0,
-      "seniority": 1,
-      "is_participating": false,
-      "participation_cap_multiple": 0.0,
-      "cumulative_dividend_rate": 0.0,
-      "years_since_issuance": 0.0
-    },
-    {
-      "name": "Options at $0.81 Exercise Price",
-      "shares_outstanding": 175000,
-      "original_investment_per_share": 0.81,
-      "liquidation_preference_multiple": 0.0,
-      "seniority": null,
-      "is_participating": false,
-      "participation_cap_multiple": 0.0,
-      "cumulative_dividend_rate": 0.0,
-      "years_since_issuance": 0.0
-    },
-    {
-      "name": "Options at $3.64 Exercise Price",
-      "shares_outstanding": 300000,
-      "original_investment_per_share": 3.64,
-      "liquidation_preference_multiple": 0.0,
-      "seniority": null,
-      "is_participating": false,
-      "participation_cap_multiple": 0.0,
-      "cumulative_dividend_rate": 0.0,
-      "years_since_issuance": 0.0
-    },
-    {
-      "name": "Options at $10.83 Exercise Price",
-      "shares_outstanding": 424337,
-      "original_investment_per_share": 10.83,
-      "liquidation_preference_multiple": 0.0,
-      "seniority": null,
-      "is_participating": false,
-      "participation_cap_multiple": 0.0,
-      "cumulative_dividend_rate": 0.0,
-      "years_since_issuance": 0.0
     }
   ],
   "total_option_pool_shares": 1167233
-}
-
-NOTE: In the example above, all preferred classes have seniority = 1 (pari passu). The three option classes total 899,337 outstanding options.
-
-CRITICAL: Return ONLY the JSON. No markdown code blocks, no explanations, just the raw JSON object."""
+}"""
 
 # API endpoints
 @app.get("/")
@@ -253,13 +302,15 @@ async def upload_document(request: FileUploadRequest):
         file_bytes = base64.b64decode(request.file_content)
         
         # Generate unique file ID
-        file_id = f"upload_{uuid.uuid4()}.txt"
+        file_extension = request.file_name.split('.')[-1].lower()
+        file_id = f"upload_{uuid.uuid4()}.{file_extension}"
         
         # Store in memory
         file_storage[file_id] = {
             "content": file_bytes,
             "original_name": request.file_name,
-            "size": len(file_bytes)
+            "size": len(file_bytes),
+            "extension": file_extension
         }
         
         return DocumentUploadResponse(
@@ -281,17 +332,28 @@ async def extract_data(request: DocumentExtractRequest):
             raise HTTPException(status_code=404, detail="File not found")
         
         file_data = file_storage[request.file_id]
-        document_text = file_data["content"].decode("utf-8")
+        file_bytes = file_data["content"]
+        file_extension = file_data.get("extension", "txt")
+        
+        # Process based on file type
+        if file_extension in ['xlsx', 'xls']:
+            # Parse Excel file
+            structured_data = parse_excel_cap_table(file_bytes)
+            document_text = json.dumps(structured_data, indent=2)
+        else:
+            # Text file - use as-is
+            document_text = file_bytes.decode("utf-8")
+            structured_data = {"source": "text"}
         
         # Call OpenAI for extraction
         response = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Extract capital structure data from this document:\n\n{document_text}"}
+                {"role": "user", "content": f"Extract capital structure data from this {'structured Excel data' if file_extension in ['xlsx', 'xls'] else 'document'}:\n\n{document_text}"}
             ],
             temperature=0.1,
-            max_tokens=2000
+            max_tokens=3000
         )
         
         # Parse response
