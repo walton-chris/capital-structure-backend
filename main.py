@@ -44,8 +44,8 @@ else:
 
 app = FastAPI(
     title="Capital Structure API",
-    version="6.3.0-robust-parser",
-    description="API with improved parsing, prompting, and error handling."
+    version="7.0.0-two-stage",
+    description="API using a two-stage AI pipeline for robust extraction."
 )
 
 app.add_middleware(
@@ -85,14 +85,13 @@ class Security(BaseModel):
     @field_validator("name")
     @classmethod
     def _non_empty(cls, v: str) -> str:
-        if not v or not v.strip(): raise ValueError("The 'name' field for a security cannot be empty.")
+        if not v or not v.strip(): raise ValueError("The 'name' field cannot be empty.")
         return v.strip()
 
 class CapitalStructureInput(BaseModel):
     securities: List[Security]
     total_option_pool_shares: NonNegativeFloat = Field(ge=0)
 
-# ... other request/response models ...
 class FileUploadRequest(BaseModel): file_content: str; file_name: str
 class DocumentExtractRequest(BaseModel): file_id: str
 class DocumentUploadResponse(BaseModel): file_id: str; file_name: str; message: str; file_size_bytes: int
@@ -103,7 +102,7 @@ class DocumentUploadResponse(BaseModel): file_id: str; file_name: str; message: 
 # =============================================================================
 
 class Anonymizer:
-    """Manages the state of anonymization to ensure consistent replacements."""
+    # ... Anonymizer class remains the same ...
     def __init__(self):
         self.name_map: Dict[str, str] = {}
         self.person_counter = 1
@@ -126,7 +125,7 @@ class Anonymizer:
         return anonymized.replace("Proof Holdings Inc.", "[The Company]")
 
 def process_and_anonymize_excel(file_bytes: bytes) -> str:
-    """Safely converts an Excel file to anonymized Markdown, trimming empty rows."""
+    # ... This function also remains the same ...
     try:
         workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
         anonymizer = Anonymizer()
@@ -134,13 +133,9 @@ def process_and_anonymize_excel(file_bytes: bytes) -> str:
         for sheet in workbook.worksheets:
             if sheet.max_row == 0: continue
             markdown_parts.append(f"## Sheet: {sheet.title}\n")
-            
-            # IMPROVEMENT: Filter out empty rows before processing
             raw_rows = [list(row) for row in sheet.iter_rows(values_only=True) if any(cell is not None for cell in row)]
             if not raw_rows: continue
-
             anonymized_rows = [[anonymizer.anonymize_cell(str(cell) if cell is not None else "") for cell in row] for row in raw_rows]
-            
             header = anonymized_rows[0]
             separator = ["---" for _ in header]
             markdown_parts.append(f"| {' | '.join(header)} |")
@@ -156,44 +151,81 @@ def process_and_anonymize_excel(file_bytes: bytes) -> str:
 
 
 # =============================================================================
-# 6. LLM Integration
+# 6. LLM Integration (Two-Stage Prompts and Calls)
 # =============================================================================
 
-# IMPROVEMENT: Added negative constraints to make the prompt more robust.
-EXTRACTION_SYSTEM_PROMPT = """You are an expert financial analyst... (Full prompt from previous version) ...
+STAGE_1_PROMPT_SUMMARIZE = """You are a data pre-processing specialist. You will be given the raw, anonymized contents of an Excel workbook in Markdown format. The file contains multiple sheets.
+
+Your task is to identify and extract ONLY the content from the two most important sheets:
+1. The primary "Detailed Cap Table".
+2. The "Option Ledger" or "Stock Option and Grant Plan" sheet.
+
+Combine the full content of these two sheets into a single, clean text block. Ignore all other summary sheets, intermediate tables, or irrelevant ledgers. Present the combined, cleaned data as plain text. Do not add any commentary or explanation.
+"""
+
+STAGE_2_PROMPT_EXTRACT = """You are an expert financial analyst. You will be given pre-filtered, clean data containing a capitalization table and an option ledger.
+
+Your task is to convert this data into a structured JSON object that strictly adheres to the provided schema.
 
 **CRITICAL INSTRUCTIONS**:
-- ... (previous instructions) ...
-- **IMPORTANT**: Ignore any rows in the tables that are clearly totals, sub-totals, or summary rows. A valid security entry must have a specific name and a corresponding number of shares. Do not create entries from rows that lack this information.
+- Identify every class of security (e.g., "Common Stock", "Series Seed Preferred") and its total outstanding shares.
+- Find all outstanding options and group them by their unique **Exercise Price**.
+- Create a **separate** security entry in the final JSON for each distinct option group. The name must be "Options at $X.XX Exercise Price".
+- **DO NOT** create a single, aggregated security for all options like "Options Outstanding".
+- Ignore any rows in the tables that are clearly totals, sub-totals, or summary rows. A valid security entry must have a specific name and a corresponding number of shares.
 - Your final output must be a single, valid JSON object and nothing else.
 """
 
-async def call_llm(document_text: str) -> Dict[str, Any]:
-    # This function's logic is sound and remains the same.
+async def call_llm_stage_1_summarize(raw_markdown: str, rid: str) -> str:
+    """First AI call to clean and filter the raw Markdown data."""
     if client is None: raise HTTPException(status_code=503, detail="AI service is not configured.")
+    logger.info(f"[rid={rid}] Starting Stage 1: Summarizing data with AI.")
     try:
-        # ... (API call logic remains the same) ...
+        def _do_call():
+            return client.chat.completions.create(
+                model="gpt-4o-mini", temperature=0.0,
+                messages=[
+                    {"role": "system", "content": STAGE_1_PROMPT_SUMMARIZE},
+                    {"role": "user", "content": raw_markdown},
+                ],
+                timeout=90.0,
+            )
+        resp = await run_in_threadpool(_do_call)
+        content = resp.choices[0].message.content
+        if not content: raise HTTPException(status_code=502, detail="AI returned an empty summary.")
+        logger.info(f"[rid={rid}] Stage 1 complete. Cleaned data length: {len(content)}")
+        return content
+    except Exception as e:
+        logger.error(f"[rid={rid}] AI call failed during Stage 1 (Summarize): {e}")
+        raise HTTPException(status_code=503, detail="AI service failed during the summarization stage.")
+
+async def call_llm_stage_2_extract(cleaned_data: str, rid: str) -> Dict[str, Any]:
+    """Second AI call to extract structured JSON from the cleaned data."""
+    if client is None: raise HTTPException(status_code=503, detail="AI service is not configured.")
+    logger.info(f"[rid={rid}] Starting Stage 2: Extracting structure from cleaned data.")
+    try:
         def _do_call():
             return client.chat.completions.create(
                 model="gpt-4o", temperature=0.0,
                 response_format={"type": "json_object"},
                 max_tokens=4096,
                 messages=[
-                    {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Here is the anonymized cap table data... \n\n{document_text}"},
+                    {"role": "system", "content": STAGE_2_PROMPT_EXTRACT},
+                    {"role": "user", "content": cleaned_data},
                 ],
-                timeout=120.0,
+                timeout=90.0,
             )
         resp = await run_in_threadpool(_do_call)
         content = resp.choices[0].message.content
-        if not content: raise HTTPException(status_code=502, detail="AI returned empty response.")
+        if not content: raise HTTPException(status_code=502, detail="AI returned an empty JSON object.")
+        logger.info(f"[rid={rid}] Stage 2 complete.")
         return json.loads(content)
     except json.JSONDecodeError:
-        logger.error(f"Failed to parse LLM JSON. Content: {content[:500]}")
-        raise HTTPException(status_code=502, detail="AI returned malformed JSON.")
+        logger.error(f"[rid={rid}] Failed to parse LLM JSON in Stage 2. Content: {content[:500]}")
+        raise HTTPException(status_code=502, detail="AI returned malformed JSON during extraction.")
     except Exception as e:
-        logger.error(f"OpenAI API call failed: {e}")
-        raise HTTPException(status_code=503, detail="AI service is unavailable or timed out.")
+        logger.error(f"[rid={rid}] AI call failed during Stage 2 (Extract): {e}")
+        raise HTTPException(status_code=503, detail="AI service failed during the extraction stage.")
 
 
 # =============================================================================
@@ -208,7 +240,6 @@ async def health(): return {"status": "healthy"}
 
 @app.post("/api/documents/upload", response_model=DocumentUploadResponse, status_code=201, tags=["Document Processing"])
 async def upload_document(request: FileUploadRequest):
-    # This endpoint is stable and remains the same.
     encoded_len = len(request.file_content)
     if (encoded_len * 3 / 4) > MAX_UPLOAD_BYTES: raise HTTPException(status_code=413, detail="File is too large.")
     try:
@@ -239,39 +270,42 @@ async def extract_data(payload: DocumentExtractRequest):
         logger.error(f"[rid={rid}] File missing at path: {path}")
         raise HTTPException(status_code=410, detail="File has expired.")
     
-    llm_obj = None # Define here for access in exception blocks
+    llm_obj = None
     try:
         def _read_and_process():
             with open(path, "rb") as f:
                 return process_and_anonymize_excel(f.read())
         
-        document_text = await run_in_threadpool(_read_and_process)
-        llm_obj = await call_llm(document_text)
+        anonymized_markdown = await run_in_threadpool(_read_and_process)
+        
+        # STAGE 1: Summarize and clean the data
+        cleaned_data = await call_llm_stage_1_summarize(anonymized_markdown, rid)
+        
+        # STAGE 2: Extract the final JSON from the clean data
+        llm_obj = await call_llm_stage_2_extract(cleaned_data, rid)
+
         result = CapitalStructureInput.model_validate(llm_obj)
         
         if not result.securities:
             raise HTTPException(status_code=502, detail="AI returned a valid but empty list of securities.")
         return result
 
-    # REFACTORED: New, specific error handling for Pydantic validation failures.
     except ValidationError as e:
         error_details = e.errors()
-        logger.error(f"[rid={rid}] AI response failed Pydantic validation. Details: {error_details}. AI Response: {llm_obj}")
-        # Provide a clean, specific error message to the frontend.
+        logger.error(f"[rid={rid}] Final JSON failed validation. Details: {error_details}. AI Response: {llm_obj}")
         first_error = error_details[0]
         field = " -> ".join(map(str, first_error['loc']))
         msg = first_error['msg']
-        raise HTTPException(status_code=400, detail=f"AI returned invalid data. Field: '{field}', Error: {msg}")
+        raise HTTPException(status_code=502, detail=f"AI returned invalid data structure. Field: '{field}', Error: {msg}")
     
     except (ValueError, HTTPException) as e:
-        # Catch our own explicit errors (like from parsing) or re-raise HTTPExceptions.
         status_code = e.status_code if isinstance(e, HTTPException) else 400
         detail = e.detail if isinstance(e, HTTPException) else str(e)
         logger.warning(f"[rid={rid}] Handled error during extraction: {detail}")
         raise HTTPException(status_code=status_code, detail=detail)
 
     except Exception:
-        logger.exception(f"[rid={rid}] An unexpected, unhandled error occurred during extraction.")
+        logger.exception(f"[rid={rid}] An unexpected, unhandled error occurred.")
         raise HTTPException(status_code=500, detail="An unexpected server error occurred.")
         
     finally:
