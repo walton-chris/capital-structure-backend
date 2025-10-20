@@ -44,7 +44,7 @@ else:
 
 app = FastAPI(
     title="Capital Structure API",
-    version="6.1.0-safe-anonymizer",
+    version="6.2.0-prompt-fix",
     description="API using a robust, cell-by-cell anonymizer for the LLM-first approach."
 )
 
@@ -107,79 +107,54 @@ class DocumentUploadResponse(BaseModel):
 
 
 # =============================================================================
-# 5. NEW "LLM-First" Anonymizer & Parser
+# 5. "LLM-First" Anonymizer & Parser
 # =============================================================================
 
 class Anonymizer:
-    """Manages the state of anonymization to ensure consistent replacements."""
     def __init__(self):
         self.name_map: Dict[str, str] = {}
         self.person_counter = 1
         self.entity_counter = 1
-        # More robust patterns to catch various name formats
         self.person_pattern = re.compile(r'\b[A-Z][a-z]+,?\s[A-Z][a-zA-Z\.\-]+\b')
         self.entity_pattern = re.compile(r'\b[A-Z][A-Za-z\s,&]+\s(?:LLC|Inc|LP|FBO|Capital|Partners|Fund|Trust|Ventures|Co\.)\b')
 
     def _get_placeholder(self, name: str, is_entity: bool) -> str:
-        if name in self.name_map:
-            return self.name_map[name]
-        
+        if name in self.name_map: return self.name_map[name]
         if is_entity:
             placeholder = f"Entity-{self.entity_counter}"
             self.entity_counter += 1
         else:
             placeholder = f"Person-{self.person_counter}"
             self.person_counter += 1
-        
         self.name_map[name] = placeholder
         return placeholder
 
     def anonymize_cell(self, cell_content: str) -> str:
-        """Anonymizes names within a single cell's string content."""
-        if not isinstance(cell_content, str) or not cell_content.strip():
-            return cell_content
-        
-        # Replace entities first as they can be more specific
+        if not isinstance(cell_content, str) or not cell_content.strip(): return cell_content
         anonymized_content = self.entity_pattern.sub(lambda m: self._get_placeholder(m.group(0), True), cell_content)
-        # Then replace person names
         anonymized_content = self.person_pattern.sub(lambda m: self._get_placeholder(m.group(0), False), anonymized_content)
-        
         return anonymized_content.replace("Proof Holdings Inc.", "[The Company]")
 
 def process_and_anonymize_excel(file_bytes: bytes) -> str:
-    """
-    Safely converts an Excel file to anonymized Markdown by processing cell by cell.
-    """
     try:
         workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
         anonymizer = Anonymizer()
         markdown_parts = []
-
         for sheet in workbook.worksheets:
             if sheet.max_row == 0: continue
-            
             markdown_parts.append(f"## Sheet: {sheet.title}\n")
-            
             anonymized_rows = []
             for row in sheet.iter_rows(values_only=True):
-                anonymized_row = [anonymizer.anonymize_cell(str(cell) if cell is not None else "") for cell in row]
-                anonymized_rows.append(anonymized_row)
-            
+                anonymized_rows.append([anonymizer.anonymize_cell(str(cell) if cell is not None else "") for cell in row])
             if not anonymized_rows: continue
-            
             header = anonymized_rows[0]
             separator = ["---" for _ in header]
-            
             markdown_parts.append(f"| {' | '.join(header)} |")
             markdown_parts.append(f"| {' | '.join(separator)} |")
-
             for row in anonymized_rows[1:]:
-                if len(row) < len(header):
-                    row.extend([""] * (len(header) - len(row)))
+                if len(row) < len(header): row.extend([""] * (len(header) - len(row)))
                 markdown_parts.append(f"| {' | '.join(row[:len(header)])} |")
-            
             markdown_parts.append("\n")
-            
         return "\n".join(markdown_parts)
     except Exception as e:
         logger.exception("Failed during Excel to Markdown conversion/anonymization.")
@@ -190,7 +165,26 @@ def process_and_anonymize_excel(file_bytes: bytes) -> str:
 # 6. LLM Integration
 # =============================================================================
 
-EXTRACTION_SYSTEM_PROMPT = """You are an expert financial analyst...""" # (Same LLM-First prompt as before)
+# FIXED: Added a more explicit final instruction to output JSON.
+EXTRACTION_SYSTEM_PROMPT = """You are an expert financial analyst specializing in venture capital cap tables. You will be given the full contents of a company's capitalization table from an Excel workbook, converted to Markdown format. Each sheet is separated by a `## Sheet: ...` header.
+
+Your task is to meticulously analyze all the provided sheets and perform the following actions:
+
+1.  **Identify Key Sheets**: Locate the primary "Detailed Cap Table" and the "Option Plan" or equivalent ledger. The data may be spread across multiple sheets.
+
+2.  **Extract All Securities**: From the main capitalization table, identify every class of security (e.g., "Common Stock", "Series Seed Preferred", "Series A Preferred Stock", etc.). For each, extract the total number of outstanding shares.
+
+3.  **Extract Option Details**: From the option ledger sheet, find all outstanding options. You **MUST** group these options by their unique **Exercise Price**.
+
+4.  **Consolidate and Structure**: Compile all the extracted information into a single, structured JSON object that strictly adheres to the provided schema.
+
+**CRITICAL INSTRUCTIONS**:
+- Create a **separate** security entry in the final JSON for each distinct option group based on its exercise price. The name must be "Options at $X.XX Exercise Price".
+- **DO NOT** create a single, aggregated security for all options like "Options Outstanding".
+- The stakeholder names in the input data have been anonymized for privacy. Do not mention "Person-1", "Entity-A", etc., in your output.
+- All numerical fields in the output JSON must be numbers, not strings.
+- Your final output must be a single, valid JSON object and nothing else.
+"""
 
 async def call_llm(document_text: str) -> Dict[str, Any]:
     if client is None:
