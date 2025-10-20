@@ -75,17 +75,18 @@ CRITICAL INSTRUCTIONS FOR CAP TABLES:
    - If you see a stakeholder table with many rows, scroll down to find summary rows like "Total Shares outstanding" and "Price per share"
 
 2. **Stock Options - CRITICAL:**
-   - If you see an "Options Ledger" or "Stock Option and Grant Plan Ledger", you MUST parse it
-   - Look for the "Options Outstanding" column (NOT "Options Granted")
-   - Some options may have been exercised or canceled, so Outstanding < Granted
-   - Group all outstanding options by their "Exercise Price" column
+   - If you see an "Options Ledger" or "Stock Option and Grant Plan Ledger", you MUST parse it carefully
+   - Look for the "Options Outstanding" column (column 5 typically, NOT "Options Granted")
+   - IMPORTANT: Some rows show 0 in "Options Outstanding" because they were exercised/canceled - SKIP THESE ROWS
+   - Only sum rows where "Options Outstanding" > 0
+   - For each row with outstanding options, note both:
+     * The "Exercise Price" value (e.g., $0.81, $3.64, $10.83)
+     * The "Options Outstanding" value (NOT "Options Granted")
+   - Group by Exercise Price and sum ONLY the "Options Outstanding" values
    - Create a SEPARATE security entry for each unique exercise price
    - Name them: "Options at $X.XX Exercise Price"
-   - The shares_outstanding for each option class = sum of ONLY the "Options Outstanding" column for that exercise price
-   - The original_investment_per_share = the exercise price
-   - DO NOT include canceled, expired, or exercised options
-   - DO NOT create a single "Options and RSUs" security
-   - Total options across all exercise prices must equal the "Options outstanding" number in the main cap table (usually ~899,337)
+   - VERIFICATION: Your total across all exercise prices MUST equal the number shown in the row "Options and RSU's issued and outstanding" (typically 899,337)
+   - If your total is higher, you're counting exercised/canceled options - recount using ONLY rows with Options Outstanding > 0
 
 3. **Options Available for Grant:**
    - Look for "Shares available for issuance under the plan"
@@ -100,13 +101,16 @@ CRITICAL INSTRUCTIONS FOR CAP TABLES:
    - Then Series A-1 price is $7.66, NOT $42.57!
    - Be VERY careful with column alignment
 
-5. **Seniority:**
-   - If the document says "pari passu" or shows all preferred with same liquidation preference:
-     * ALL preferred stock classes = seniority 1
+5. **Seniority - CRITICAL:**
+   - If the document says "pari passu" OR if all preferred classes have the same liquidation preference multiple (typically 1.0x):
+     * ALL preferred stock classes MUST have seniority = 1 (not 1, 2, 3 - ALL ARE 1)
      * Common stock = null (no seniority)
      * Options = null (no seniority)
-   - If different liquidation preferences exist:
+   - Pari passu means "equal footing" - all preferred classes are treated equally in liquidation
+   - NEVER assign Series Seed = 1, Series A = 2, Series A-1 = 3 when they're pari passu
+   - If different liquidation preferences exist (e.g., Series A has 2x, Series B has 1x):
      * Most senior (highest preference) = 1
+     * Next senior = 2
      * Least senior (Common) = highest number
 
 6. **Shares Outstanding:**
@@ -124,9 +128,25 @@ CRITICAL INSTRUCTIONS FOR CAP TABLES:
 
 VALIDATION CHECKS:
 - If you see options with multiple exercise prices, you MUST create separate entries
-- Total option shares across all exercise prices must match the cap table's "Options outstanding"
+- Sum ONLY the "Options Outstanding" column from the ledger (not "Options Granted")
+- Total option shares across all exercise prices MUST match the cap table's "Options outstanding" row
+- If your calculated total doesn't match, recount using ONLY "Options Outstanding" column
 - The "available for grant" number goes in total_option_pool_shares
 - Never assign a preferred stock's price to a different preferred class
+
+STEP-BY-STEP FOR OPTIONS:
+1. Find the option ledger section in the document
+2. Identify the "Options Outstanding" column (typically column 5)
+3. Identify the "Exercise Price" column (typically column 8)
+4. For EACH row in the ledger:
+   - Check if "Options Outstanding" > 0
+   - If YES: note the Exercise Price and Options Outstanding value
+   - If NO (or 0): SKIP this row (option was exercised/canceled)
+5. Group by Exercise Price: for each unique price, sum all "Options Outstanding" values
+6. Create one security entry per unique Exercise Price
+7. FINAL CHECK: Sum your three option class totals
+   - If total ≠ 899,337, you made an error - recount excluding exercised options
+   - Look for the row "Options and RSU's issued and outstanding" to verify your total
 
 Return ONLY valid JSON in this exact format:
 {
@@ -154,9 +174,53 @@ Return ONLY valid JSON in this exact format:
       "years_since_issuance": 0.0
     },
     {
+      "name": "Series A Preferred Stock",
+      "shares_outstanding": 1411738,
+      "original_investment_per_share": 42.57,
+      "liquidation_preference_multiple": 1.0,
+      "seniority": 1,
+      "is_participating": false,
+      "participation_cap_multiple": 0.0,
+      "cumulative_dividend_rate": 0.0,
+      "years_since_issuance": 0.0
+    },
+    {
+      "name": "Series A-1 Preferred Stock",
+      "shares_outstanding": 1634508,
+      "original_investment_per_share": 7.66,
+      "liquidation_preference_multiple": 1.0,
+      "seniority": 1,
+      "is_participating": false,
+      "participation_cap_multiple": 0.0,
+      "cumulative_dividend_rate": 0.0,
+      "years_since_issuance": 0.0
+    },
+    {
       "name": "Options at $0.81 Exercise Price",
-      "shares_outstanding": 299439,
+      "shares_outstanding": 175000,
       "original_investment_per_share": 0.81,
+      "liquidation_preference_multiple": 0.0,
+      "seniority": null,
+      "is_participating": false,
+      "participation_cap_multiple": 0.0,
+      "cumulative_dividend_rate": 0.0,
+      "years_since_issuance": 0.0
+    },
+    {
+      "name": "Options at $3.64 Exercise Price",
+      "shares_outstanding": 300000,
+      "original_investment_per_share": 3.64,
+      "liquidation_preference_multiple": 0.0,
+      "seniority": null,
+      "is_participating": false,
+      "participation_cap_multiple": 0.0,
+      "cumulative_dividend_rate": 0.0,
+      "years_since_issuance": 0.0
+    },
+    {
+      "name": "Options at $10.83 Exercise Price",
+      "shares_outstanding": 424337,
+      "original_investment_per_share": 10.83,
       "liquidation_preference_multiple": 0.0,
       "seniority": null,
       "is_participating": false,
@@ -167,6 +231,8 @@ Return ONLY valid JSON in this exact format:
   ],
   "total_option_pool_shares": 1167233
 }
+
+NOTE: In the example above, all preferred classes have seniority = 1 (pari passu). The three option classes total 899,337 outstanding options.
 
 CRITICAL: Return ONLY the JSON. No markdown code blocks, no explanations, just the raw JSON object."""
 
