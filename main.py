@@ -44,7 +44,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI(
     title="Capital Structure API",
-    version="3.0.1-dev",
+    version="3.1.0-fix", # Updated version
     description="API for extracting structured data from financial documents."
 )
 
@@ -295,58 +295,35 @@ def parse_excel_cap_table(file_bytes: bytes) -> Dict[str, Any]:
 # LLM Integration
 # =============================================================================
 
-# TODO: The logic in this prompt is hardcoded (e.g., liquidation_preference_multiple = 1.0).
-# A more advanced implementation would instruct the LLM to find these values
-# in the source document first, falling back to defaults only if necessary.
+# IMPROVED: This prompt is more explicit and forceful to ensure the AI correctly
+# processes options by breaking them down by exercise price.
 EXTRACTION_SYSTEM_PROMPT = """You are an expert financial analyst specializing in venture capital cap tables.
-You receive STRUCTURED data extracted from Excel cap tables.
-
-INPUT FORMAT EXAMPLE:
-{
-  "cap_table": {
-    "totals": {"Common": 8054469, "Series Seed Preferred": 2285713},
-    "prices": {"Series Seed Preferred": 0.44, "Series A Preferred Stock": 42.57},
-    "options_outstanding": 899337,
-    "option_pool_available": 1167233
-  },
-  "option_ledger": [
-    {"options_outstanding": 114286, "exercise_price": 0.81}
-  ]
-}
+You receive STRUCTURED data extracted from an Excel file.
 
 INSTRUCTIONS:
-1. Create a security entry for every key in cap_table.totals:
-   - name = the key
-   - shares_outstanding = totals[name]
-   - original_investment_per_share = prices[name] or 0.0 if missing
-   - liquidation_preference_multiple:
-       - preferred: 1.0
-       - common/options/other: 0.0
-   - seniority:
-       - preferred with 1.0x = 1
-       - common/options/other = null
-   - is_participating = false
-   - participation_cap_multiple = 0.0
-   - cumulative_dividend_rate = 0.0
-   - years_since_issuance = 0.0
+1.  Process `cap_table.totals`: Create a security for every key in this dictionary.
+    - **CRITICAL EXCEPTION**: If a key contains "Option", "RSU", or "Plan", **you MUST IGNORE it**. Do not create a general security for options from here. Options are handled ONLY in the next step.
+    - For all other keys (e.g., "Common", "Series A Preferred Stock"):
+        - `name` = the key
+        - `shares_outstanding` = the value from `totals`
+        - `original_investment_per_share` = the value from `prices` for that key, or 0.0 if missing.
+        - Set other financial properties based on the security type (preferred vs. common).
 
-2. Group option_ledger by exercise_price; sum options_outstanding for each price.
-   For each group, add a security named "Options at $X.XX Exercise Price" with:
-     shares_outstanding = sum for that price
-     original_investment_per_share = 0.0
-     liquidation_preference_multiple = 0.0
-     seniority = null
-     is_participating = false
-     participation_cap_multiple = 0.0
-     cumulative_dividend_rate = 0.0
-     years_since_issuance = 0.0
+2.  Process `option_ledger`: This is the **ONLY** source for options data. You MUST process every entry.
+    - First, group all entries in the `option_ledger` list by their `exercise_price`.
+    - For each unique exercise price group, you **MUST** create a new, separate security.
+    - The `name` for each security **MUST** be "Options at $X.XX Exercise Price", where X.XX is the exercise price formatted to two decimal places.
+    - The `shares_outstanding` for this security is the SUM of `options_outstanding` for all items in that group.
+    - All other fields (`liquidation_preference_multiple`, `seniority`, etc.) for these option securities **MUST** be 0.0 or null as specified in the output schema.
 
-3. total_option_pool_shares = cap_table.option_pool_available or 0.
+3.  Set `total_option_pool_shares`:
+    - This value is `cap_table.option_pool_available`, or 0 if it's missing.
 
-OUTPUT REQUIREMENTS:
-- Return ONLY a JSON object conforming to the specified output schema.
-- No markdown fences. No comments.
+4.  Final Output Rules:
+    - **DO NOT** create a single, aggregated security like "Options and RSU's Outstanding". You MUST break them down by exercise price from the `option_ledger`.
+    - Return ONLY the final JSON object. No markdown, no comments, no conversational text.
 """
+
 
 def _remap_common_llm_mistakes(obj: Dict[str, Any]) -> Dict[str, Any]:
     """Tolerantly repair common model mistakes before Pydantic validation."""
@@ -371,12 +348,12 @@ async def call_llm(document_text: str) -> Dict[str, Any]:
                 model="gpt-4o-mini",
                 response_format={"type": "json_object"},
                 temperature=0.1,
-                max_tokens=2048, # Increased for potentially larger cap tables
+                max_tokens=2048,  # Increased for potentially larger cap tables
                 messages=[
                     {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
                     {"role": "user", "content": f"Extract capital structure:\n\n{document_text}"},
                 ],
-                timeout=45.0, # Seconds
+                timeout=45.0,  # Seconds
             )
         resp = await run_in_threadpool(_do_call)
         content = resp.choices[0].message.content
