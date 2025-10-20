@@ -1,1 +1,9 @@
-python-3.11
+fastapi
+uvicorn
+gunicorn
+redis
+rq
+openpyxl
+pydantic
+requests
+openai>=1.0.0
