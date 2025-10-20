@@ -5,6 +5,7 @@ import json
 import io
 import re
 from typing import List, Optional, Dict, Any
+from collections import defaultdict
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -396,6 +397,8 @@ async def upload_document(request: FileUploadRequest):
 async def extract_data(request: DocumentExtractRequest):
     """Extract capital structure data from uploaded document"""
     try:
+        print(f"Extract requested for file_id: {request.file_id}")
+        
         if request.file_id not in file_storage:
             raise HTTPException(status_code=404, detail="File not found")
         
@@ -403,62 +406,87 @@ async def extract_data(request: DocumentExtractRequest):
         file_bytes = file_data["content"]
         file_extension = file_data.get("extension", "txt")
         
+        print(f"Processing file: {file_data['original_name']} (type: {file_extension})")
+        
         # Process based on file type
         if file_extension in ['xlsx', 'xls']:
-            structured_data = parse_excel_cap_table(file_bytes)
-            
-            # Debug logging
-            print("=" * 60)
-            print("EXTRACTED CAP TABLE DATA:")
-            print("=" * 60)
-            cap_table = structured_data.get("cap_table", {})
-            print(f"Headers found: {cap_table.get('headers', [])}")
-            print(f"Totals: {json.dumps(cap_table.get('totals', {}), indent=2)}")
-            print(f"Prices: {json.dumps(cap_table.get('prices', {}), indent=2)}")
-            print(f"Options outstanding: {cap_table.get('options_outstanding')}")
-            print(f"Option pool available: {cap_table.get('option_pool_available')}")
-            print(f"\nOption ledger entries: {len(structured_data.get('option_ledger', []))}")
-            if structured_data.get('option_ledger'):
-                # Group by exercise price for summary
-                from collections import defaultdict
-                by_price = defaultdict(list)
-                for opt in structured_data['option_ledger']:
-                    by_price[opt['exercise_price']].append(opt['options_outstanding'])
-                for price, outstandings in sorted(by_price.items()):
-                    total = sum(outstandings)
-                    print(f"  ${price}: {len(outstandings)} grants = {total:,.0f} shares")
-            print("=" * 60)
-            
-            document_text = json.dumps(structured_data, indent=2)
+            try:
+                print("Parsing Excel file...")
+                structured_data = parse_excel_cap_table(file_bytes)
+                
+                # Debug logging
+                print("=" * 60)
+                print("EXTRACTED CAP TABLE DATA:")
+                print("=" * 60)
+                cap_table = structured_data.get("cap_table", {})
+                print(f"Headers found: {cap_table.get('headers', [])}")
+                print(f"Totals: {json.dumps(cap_table.get('totals', {}), indent=2)}")
+                print(f"Prices: {json.dumps(cap_table.get('prices', {}), indent=2)}")
+                print(f"Options outstanding: {cap_table.get('options_outstanding')}")
+                print(f"Option pool available: {cap_table.get('option_pool_available')}")
+                print(f"\nOption ledger entries: {len(structured_data.get('option_ledger', []))}")
+                if structured_data.get('option_ledger'):
+                    # Group by exercise price for summary
+                    by_price = defaultdict(list)
+                    for opt in structured_data['option_ledger']:
+                        by_price[opt['exercise_price']].append(opt['options_outstanding'])
+                    for price, outstandings in sorted(by_price.items()):
+                        total = sum(outstandings)
+                        print(f"  ${price}: {len(outstandings)} grants = {total:,.0f} shares")
+                print("=" * 60)
+                
+                document_text = json.dumps(structured_data, indent=2)
+            except Exception as excel_error:
+                print(f"ERROR parsing Excel: {str(excel_error)}")
+                import traceback
+                traceback.print_exc()
+                raise HTTPException(status_code=500, detail=f"Excel parsing failed: {str(excel_error)}")
         else:
+            print("Processing as text file...")
             document_text = file_bytes.decode("utf-8")
         
         # Call OpenAI
-        response = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Extract capital structure:\n\n{document_text}"}
-            ],
-            temperature=0.1,
-            max_tokens=3000
-        )
+        try:
+            print("Calling OpenAI API...")
+            response = openai.ChatCompletion.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Extract capital structure:\n\n{document_text}"}
+                ],
+                temperature=0.1,
+                max_tokens=3000
+            )
+            
+            extracted_json = response.choices[0].message.content.strip()
+            print(f"OpenAI response received ({len(extracted_json)} chars)")
+            
+            # Remove markdown if present
+            if extracted_json.startswith("```"):
+                extracted_json = extracted_json.split("```")[1]
+                if extracted_json.startswith("json"):
+                    extracted_json = extracted_json[4:]
+                extracted_json = extracted_json.strip()
+            
+            print("Validating response...")
+            result = CapitalStructureInput.model_validate_json(extracted_json)
+            print("Validation successful!")
+            return result
+            
+        except openai.error.OpenAIError as openai_error:
+            print(f"OpenAI API error: {str(openai_error)}")
+            raise HTTPException(status_code=500, detail=f"OpenAI API error: {str(openai_error)}")
+        except json.JSONDecodeError as json_error:
+            print(f"JSON parsing error: {str(json_error)}")
+            print(f"AI Response: {extracted_json[:500]}...")
+            raise HTTPException(status_code=500, detail=f"Failed to parse AI response: {str(json_error)}")
         
-        extracted_json = response.choices[0].message.content.strip()
-        
-        # Remove markdown if present
-        if extracted_json.startswith("```"):
-            extracted_json = extracted_json.split("```")[1]
-            if extracted_json.startswith("json"):
-                extracted_json = extracted_json[4:]
-            extracted_json = extracted_json.strip()
-        
-        result = CapitalStructureInput.model_validate_json(extracted_json)
-        return result
-        
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse AI response: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"Unexpected error in extract_data: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
 
 if __name__ == "__main__":
